@@ -114,7 +114,9 @@ entity TG68KdotC_Kernel is
 		BitField : integer := 2;			--0=>no,			1=>yes,				2=>switchable with CPU(1) 
 		
 		BarrelShifter : integer := 1;		--0=>no,			1=>yes,				2=>switchable with CPU(1)  
-		MUL_Hardware : integer := 1		--0=>no,			1=>yes,  
+		MUL_Hardware : integer := 1;		--0=>no,			1=>yes,
+		-- Optional pair transfers: bit 0=data, bit 1=immediate, bit 2=absolute address.
+		DataPath32 : std_logic_vector(2 downto 0) := "111"
 		);
 	port(clk						: in std_logic;
 		nReset					: in std_logic;			--low active
@@ -469,7 +471,7 @@ ALU: TG68K_ALU
 	-- wb_plain records the ordinary-longword mask for both data and writeback.
 	-- The former active qualifier differed only in idle state; state(1)
 	-- already excludes idle/fetch cycles. Bitfield masks must not qualify.
-	cand <= '1' WHEN CPU="11" AND wb_plain='1' AND
+	cand <= '1' WHEN DataPath32(0)='1' AND CPU="11" AND wb_plain='1' AND
 	                 memmask="100001" AND addr(1 downto 0)="00" AND state(1)='1' ELSE '0';
 
 	-- These instructions fetch their high immediate word during decode.
@@ -534,7 +536,9 @@ ALU: TG68K_ALU
 	-- Accepting both words skips the following operand-only bus step.
 	ext32_cand <= '1' WHEN CPU="11" AND Reset='0' AND state="00" AND
 	                      decodeOPC='1' AND memmask="100111" AND
-	                      addr(1 downto 0)="00" AND (imm32_op='1' OR abs32_op='1') ELSE '0';
+	                      addr(1 downto 0)="00" AND
+	                      ((DataPath32(1)='1' AND imm32_op='1') OR
+	                       (DataPath32(2)='1' AND abs32_op='1')) ELSE '0';
 
 	long_cand <= cand OR ext32_cand;
 	ext32_ack <= ext32_cand AND long_ack;
@@ -543,7 +547,7 @@ ALU: TG68K_ALU
 
 	-- Used only with aligned data/extension pairs.
 	addr_p2 <= addr(31 downto 2) & "10";
-	data_write_lo <= data_write_mux(15 downto 0);
+	data_write_lo <= data_write_mux(15 downto 0) WHEN DataPath32(0)='1' ELSE (others=>'0');
 	clkena_lw <= '1' WHEN clkena_in='1' AND (memmaskmux(3)='1' OR l1='1') ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
