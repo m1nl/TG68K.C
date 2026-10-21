@@ -131,6 +131,15 @@ entity TG68KdotC_Kernel is
 		nLDS						: out std_logic;
 		busstate					: out std_logic_vector(1 downto 0);	-- 00-> fetch code 10->read data 11->write data 01->no memaccess
 		longword					: out std_logic;
+		-- Optional 68020 aligned 32-bit data transfers (CPU="11").
+		-- On long_cand, long_ack completes both words with clkena_in.
+		-- Reads: data_in_hi = bits 31:16, data_in = bits 15:0.
+		-- Writes: data_write = bits 31:16, data_write_lo = bits 15:0.
+		-- Without long_ack, the normal 16-bit transfer sequence is used.
+		long_cand               : out std_logic;
+		long_ack                : in std_logic:='0';
+		data_in_hi              : in std_logic_vector(15 downto 0):=(others=>'0');
+		data_write_lo           : out std_logic_vector(15 downto 0);
 		nResetOut				: out std_logic;
 		FC							: out std_logic_vector(2 downto 0);
 		clr_berr					: out std_logic;
@@ -363,6 +372,11 @@ architecture logic of TG68KdotC_Kernel is
 	signal exec					: bit_vector(lastOpcBit downto 0);
 
 	signal micro_state		: micro_states;
+	signal mm_plain         : std_logic;
+	signal wb_plain         : std_logic;
+	signal cand             : std_logic;
+	signal l1               : std_logic;
+	signal addr_p2          : std_logic_vector(31 downto 0);
 	signal next_micro_state	: micro_states;
 	
 
@@ -423,7 +437,7 @@ ALU: TG68K_ALU
 	-- AMR - let the parent module know this is a longword access.  (Easy way to enable burst writes.)
 	longword <= not memmaskmux(3);
 	
-	long_start_alu <= to_bit(NOT memmaskmux(3));
+	long_start_alu <= to_bit(NOT memmaskmux(3) AND NOT cand);
 	execOPC_ALU <= execOPC OR exec(alu_exec);
 	process (memmaskmux)
 	begin
@@ -447,7 +461,15 @@ ALU: TG68K_ALU
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
 	nUDS <= memmaskmux(5);
 	nLDS <= memmaskmux(4);
-	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' ELSE '0';
+	-- Only ordinary aligned longwords qualify; bitfield masks may match too.
+	cand <= '1' WHEN CPU="11" AND mm_plain='1' AND
+	                 memmask="100001" AND addr(1 downto 0)="00" AND state(1)='1' ELSE '0';
+	long_cand <= cand;
+	l1 <= long_ack AND cand;
+	-- Used only with cand/l1, which require four-byte alignment.
+	addr_p2 <= addr(31 downto 2) & "10";
+	data_write_lo <= data_write_mux(15 downto 0);
+	clkena_lw <= '1' WHEN clkena_in='1' AND (memmaskmux(3)='1' OR l1='1') ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
 	PROCESS (clk, nReset)
@@ -470,7 +492,7 @@ ALU: TG68K_ALU
 		END IF;
 	END PROCESS;
 			
-PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read)
+PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read, l1, data_in_hi)
 	BEGIN
 		IF memmaskmux(4)='0' THEN
 			data_read <= last_data_in(15 downto 0)&data_in;
@@ -481,6 +503,10 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			data_read(31 downto 16) <= (OTHERS=>data_read(15));
 		END IF;	
 		
+		IF l1='1' THEN
+			data_read <= data_in_hi&data_in;
+		END IF;
+
 		IF rising_edge(clk) THEN	
 			IF clkena_lw='1' AND state="10" THEN
 				IF memmaskmux(4)='0' THEN
@@ -496,11 +522,15 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 					last_data_read <= data_read;
 					IF state(1)='0' AND memmask(1)='0' THEN
 						last_data_read(31 downto 16) <= last_opc_read;
-					ELSIF state(1)='0' OR memread(1)='1' THEN
+					ELSIF state(1)='0' OR (memread(1)='1' AND l1='0') THEN
 						last_data_read(31 downto 16) <= (OTHERS=>data_in(15));
 					END IF;
 				END IF;
-				last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
+				IF l1='1' THEN
+					last_data_in <= data_in_hi&data_in;
+				ELSE
+					last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
+				END IF;
 				
 			END IF;
 		END IF;
@@ -689,14 +719,16 @@ PROCESS (opcode, movem_presub, movem_regaddr, source_lowbits, source_areg, sndOP
 -----------------------------------------------------------------------------
 -- set OP1out
 -----------------------------------------------------------------------------
-PROCESS (reg_QA, store_in_tmp, ea_data, long_start, addr, exec, memmaskmux)
+PROCESS (reg_QA, store_in_tmp, ea_data, long_start, addr, exec, memmaskmux, cand, addr_p2)
 	BEGIN
 		OP1out <= reg_QA;
 		IF exec(OP1out_zero)='1' THEN
 			OP1out <= (OTHERS => '0');	
 		ELSIF exec(ea_data_OP1)='1' AND store_in_tmp='1' THEN
 			OP1out <= ea_data;
-		ELSIF exec(movem_action)='1' OR memmaskmux(3)='0' OR exec(OP1addr)='1' THEN 
+		ELSIF cand='1' AND (exec(movem_action)='1' OR exec(OP1addr)='1') THEN
+			OP1out <= addr_p2;
+		ELSIF exec(movem_action)='1' OR (memmaskmux(3)='0' AND cand='0') OR exec(OP1addr)='1' THEN
 			OP1out <= addr;
 		END IF;
 	END PROCESS;
@@ -784,7 +816,11 @@ PROCESS (clk)
 				IF state="10" AND exec(hold_ea_data)='0' THEN
 					ea_data <= data_read;
 				ELSIF exec(get_2ndOPC)='1' THEN
-					ea_data <= addr;
+					IF cand='1' THEN
+						ea_data <= addr_p2;
+					ELSE
+						ea_data <= addr;
+					END IF;
 				ELSIF exec(store_ea_data)='1' OR (direct_data='1' AND state="00") THEN
 					ea_data <= last_data_read;
 				END IF;	
@@ -817,7 +853,11 @@ PROCESS (clk)
 				ELSIF exec(exg)='1' THEN	
 					data_write_tmp <= OP1out;
 				ELSIF exec(get_ea_now)='1' AND ea_only='1' THEN		-- ist for pea
-					data_write_tmp <= addr;
+					IF cand='1' THEN
+						data_write_tmp <= addr_p2;
+					ELSE
+						data_write_tmp <= addr;
+					END IF;
 				ELSIF execOPC='1' THEN
 					data_write_tmp <= ALUout;
 				ELSIF (exec_DIRECT='1' AND state="10") THEN
@@ -941,18 +981,28 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 		IF rising_edge(clk) THEN
 			IF clkena_in='1' THEN
 				IF exec(get_2ndOPC)='1' OR (state="10" AND memread(0)='1') THEN
-					tmp_TG68_PC <= addr;
+					IF l1='1' AND exec(get_2ndOPC)='1' THEN
+						tmp_TG68_PC <= addr_p2;
+					ELSE
+						tmp_TG68_PC <= addr;
+					END IF;
 				END IF;
 				use_base <= '0'; 
 				memaddr_delta_regb <= (others => '0');
-				IF memmaskmux(3)='0' OR exec(mem_addsub)='1' THEN
+				IF cand='1' AND l1='0' THEN
+					memaddr_delta_rega <= addr_p2;
+				ELSIF (memmaskmux(3)='0' AND cand='0') OR exec(mem_addsub)='1' THEN
 					memaddr_delta_rega <= addsub_q;
 				ELSIF set(restore_ADDR)='1' THEN
 					memaddr_delta_rega <= tmp_TG68_PC;
 				ELSIF exec(direct_delta)='1' THEN
 					memaddr_delta_rega <= data_read;
 				ELSIF exec(ea_to_pc)='1' AND setstate="00" THEN
-					memaddr_delta_rega <= addr;
+					IF cand='1' THEN
+						memaddr_delta_rega <= addr_p2;
+					ELSE
+						memaddr_delta_rega <= addr;
+					END IF;
 				ELSIF set(addrlong)='1' THEN
 					memaddr_delta_rega <= last_data_read;
 				ELSIF setstate="00" THEN
@@ -973,7 +1023,11 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 		-- only used for movem address update
 --					IF (long_done='0' AND state(1)='1') OR movem_presub='0' THEN
 					if ((memread(0) = '1') and state(1) = '1') or movem_presub = '0' then -- fix for unaligned movem mikej
-						memaddr <= addr;
+						IF l1='1' AND movem_presub='0' THEN
+							memaddr <= addr_p2;
+						ELSE
+							memaddr <= addr;
+						END IF;
 					END IF;
 			END IF;
 		END IF;
@@ -1075,6 +1129,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 				Suppress_Base <= '0'; 
 				make_berr <= '0';
 				memmask <= "111111";
+				mm_plain <= '0';
+				wb_plain <= '0';
 				exec_write_back <= '0';
 			ELSE
 --				IPL_nr <= NOT IPL;
@@ -1087,7 +1143,11 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					IF exec(directPC)='1' THEN
 						TG68_PC <= data_read;
 					ELSIF exec(ea_to_pc)='1' THEN
-						TG68_PC <= addr;
+						IF l1='1' THEN
+							TG68_PC <= addr_p2;
+						ELSE
+							TG68_PC <= addr;
+						END IF;
 					ELSIF (state ="00" OR TG68_PC_brw = '1') AND stop='0'  THEN				
 						TG68_PC <= TG68_PC_add;
 					END IF;	
@@ -1166,30 +1226,40 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					IF (state="10" AND addrvalue='0' AND write_back='1' AND setstate/="10") OR set_rot_cnt/="000001" OR (stop='1' AND interrupt='0') OR set_exec(opcCHK)='1' THEN
 						state <= "01";
 						memmask <= "111111";
+						mm_plain <= '0';
 						addrvalue <= '0';
 					ELSIF execOPC='1' AND exec_write_back='1' THEN
 						state <= "11";
 						FC(1 downto 0) <= "01";
 						memmask <= wbmemmask;
+						mm_plain <= wb_plain;
 						addrvalue <= '0';
 					ELSE	
 						state <= setstate;
 						addrvalue <= setaddrvalue; 
 						IF setstate="01" THEN
 							memmask <= "111111";
+							mm_plain <= '0';
 							wbmemmask <= "111111";
+							wb_plain <= '0';
 						ELSIF exec(get_bfoffset)='1' THEN
 							memmask <= set_memmask;
+							mm_plain <= '0';
 							wbmemmask <= set_memmask;
+							wb_plain <= '0';
 							oddout <= set_oddout;
 						ELSIF set(longaktion)='1' THEN
 							memmask <= "100001";
+							mm_plain <= '1';
 							wbmemmask <= "100001";
+							wb_plain <= '1';
 							oddout <= '0';
 --						ELSIF set_datatype="00" AND setstate(1)='1' AND setaddrvalue='0' THEN	
 						ELSIF set_datatype="00" AND setstate(1)='1' THEN	
 							memmask <= "101111";
+							mm_plain <= '0';
 							wbmemmask <= "101111";
+							wb_plain <= '0';
 							IF set(mem_byte)='1' THEN
 								oddout <= '0';
 							ELSE
@@ -1197,7 +1267,9 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							END IF;	
 						ELSE	
 							memmask <= "100111";
+							mm_plain <= '0';
 							wbmemmask <= "100111";
+							wb_plain <= '0';
 							oddout <= '0';
 						END IF;	
 					END IF;
